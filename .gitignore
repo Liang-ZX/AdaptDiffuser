@@ -1,0 +1,17 @@
+*~
+*.npy
+*.swp
+*.swo
+*.swn
+__pycache__/
+logs
+kuka_dataset
+cond_samples
+uncond_samples
+rearrange_samples
+results
+*.pkl
+*.tar.gz
+mv_file.py
+my_dataset
+pick2put_dataset
