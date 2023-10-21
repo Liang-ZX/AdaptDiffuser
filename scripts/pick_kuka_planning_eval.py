@@ -6,14 +6,10 @@ import pdb
 import pybullet as p
 import argparse
 
-# import gym
-# import d4rl
-
-from denoising_diffusion_pytorch.denoising_diffusion_pytorch import GaussianDiffusion
+from diffusion.denoising_diffusion_pytorch_adapt import GaussianDiffusion  # TODO
 from denoising_diffusion_pytorch import Trainer
 from denoising_diffusion_pytorch.datasets.tamp import KukaDataset
-from denoising_diffusion_pytorch.mixer_old import MixerUnet
-from denoising_diffusion_pytorch.mixer import MixerUnet as MixerUnetNew
+from denoising_diffusion_pytorch.mixer import MixerUnet
 from denoising_diffusion_pytorch.temporal_attention import TemporalUnet
 from denoising_diffusion_pytorch.utils.rendering import KukaRenderer
 import diffusion.utils as utils
@@ -27,7 +23,7 @@ from diffusion.models import Config
 from gym_stacking.utils import get_bodies, sample_placement, pairwise_collision, \
     RED, GREEN, BLUE, BLACK, WHITE, BROWN, TAN, GREY, connect, get_movable_joints, set_joint_position, set_pose, add_fixed_constraint, remove_fixed_constraint, set_velocity, get_joint_positions, get_pose, enable_gravity
 
-from gym_stacking.env import StackEnv, get_env_state
+from gym_stacking.pick_env import PickandPutEnv, get_env_state
 from tqdm import tqdm
 
 
@@ -78,20 +74,14 @@ def execute(samples, env, idx=0):
 
 def eval_episode(guide, env, dataset, idx=0, args=None):
     state = env.reset()
-    # states = [state]
-
-    # idxs = [(0, 3), (1, 0), (2, 1)]
-    # cond_idxs = [map_tuple[idx] for idx in idxs]
-    # stack_idxs = [idx[0] for idx in idxs]
-    # place_idxs = [idx[1] for idx in idxs]
 
     # samples_full_list = []
     obs_dim = dataset.obs_dim
 
-    samples = torch.Tensor(state)
+    samples = torch.Tensor(state[..., :-4])
     samples = (samples - dataset.mins) / (dataset.maxs - dataset.mins + 1e-8)
     samples = samples[None, None, None].cuda()
-    samples = (samples - 0.5) * 2
+    samples = (samples - 0.5) * 2  # [0,1] -> [-1,1]
 
     conditions = [
            (0, obs_dim, samples),
@@ -102,9 +92,11 @@ def eval_episode(guide, env, dataset, idx=0, args=None):
 
     total_samples = []
 
-    for i in range(3):
-        # samples = samples_orig = trainer.ema_model.guided_conditional_sample(model, 1, conditions, cond_idxs[i], stack_idxs[i], place_idxs[i])
-        samples = samples_orig = trainer.ema_model.conditional_sample(1, conditions)
+    for i in range(4):
+        stack = env.goal[env.progress]
+        place = env.put_place[stack]
+        cond_idx = 0
+        samples = samples_orig = trainer.ema_model.guided_conditional_sample(guide, 1, conditions, cond_idx, stack, place[:2])
 
         samples = torch.clamp(samples, -1, 1)
         samples_unscale = (samples + 1) * 0.5
@@ -115,14 +107,14 @@ def eval_episode(guide, env, dataset, idx=0, args=None):
         samples, samples_list, frames_new, reward = execute(samples, env, idx=i)
         frames.extend(frames_new)
 
-        total_samples.extend(samples_list)
+        # if args.do_generate and reward > 0.5:
+        #     np.save(os.path.join(args.gen_dir, "cond_sample_{}.npy".format(idx*4+i)), np.array(samples_list))
 
-        # samples_full_list.extend(samples_list)
+        total_samples.extend(samples_list)
 
         samples = (samples - dataset.mins) / (dataset.maxs - dataset.mins + 1e-8)
         samples = torch.Tensor(samples[None, None, None]).to(samples_orig.device)
         samples = (samples - 0.5) * 2
-
 
         conditions = [
                (0, obs_dim, samples),
@@ -134,28 +126,30 @@ def eval_episode(guide, env, dataset, idx=0, args=None):
 
         print("reward: %.4f   " % reward)
 
+        env.progress = env.progress + 1
+
     if args is not None:
-        save_dir = os.path.join(args.savepath, "uncond_samples")
+        save_dir = os.path.join(args.savepath, "cond_samples")
     else:
-        save_dir = "uncond_samples"
+        save_dir = "cond_samples"
 
     if not osp.exists(save_dir):
         os.makedirs(save_dir)
 
     if env.save_render:
-        writer = get_writer(os.path.join(save_dir, "uncond_video_writer{}.mp4".format(idx)))
+        writer = get_writer(os.path.join(save_dir, "cond_video_writer{}.mp4".format(idx)))
         for frame in frames:
             writer.append_data(frame)
 
-    np.save(os.path.join(save_dir, "uncond_sample_{}.npy".format(idx)), np.array(total_samples))
+    np.save(os.path.join(save_dir, "cond_sample_{}.npy".format(idx)), np.array(total_samples))
 
     if args.do_generate:
-        gen_dir = os.path.join(args.savepath, "gen_dataset")
-        if not osp.exists(gen_dir):
-            os.makedirs(gen_dir)
-
         if rewards > 1.5:
-            np.save(os.path.join(gen_dir, "uncond_sample_{}.npy".format(idx)), np.array(total_samples))
+            np.save(os.path.join(args.gen_dir, "cond_sample_{}.npy".format(idx)), np.array(total_samples))
+
+    # writer = get_writer("video_writer.mp4")
+    # for frame in frames:
+    #     writer.append_data(frame)
 
     return rewards
 
@@ -190,14 +184,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--suffix', default='0', type=str, help='save dir suffix')
 parser.add_argument('--env_name', default="multiple_cube_kuka_temporal_convnew_real2_128", type=str, help='env name')
 parser.add_argument('--data_path', default="kuka_dataset", type=str, help='dataset root path')
+parser.add_argument('--random_seed', default=128, type=int, help="random seed")
 
-parser.add_argument('--eval_times', default=100, type=str, help='evaluation times')
 parser.add_argument('--save_render', action='store_true', help='save render')
+parser.add_argument('--eval_times', default=200, type=str, help='evaluation times')
+parser.add_argument('--do_generate', action='store_true', help='do generate')
 parser.add_argument('--diffusion_epoch', default=650, type=int, help="diffusion epoch")
-
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+seed = args.random_seed
+np.random.seed(seed)
+torch.cuda.manual_seed(seed)
 
 #### dataset
 env_name = args.env_name
@@ -206,11 +205,10 @@ T = 1000
 dataset = KukaDataset(H, data_path=args.data_path)
 
 diffusion_path = f'logs/{env_name}/'
-diffusion_epoch = args.diffusion_epoch
 
 weighted = 5.0
 
-savepath = f'logs/{env_name}/plans_weighted{weighted}_{H}_{T}/{args.suffix}'
+savepath = f'logs/{env_name}/plans_weighted{weighted}_{H}_{T}/pick2put/{args.suffix}'
 utils.mkdir(savepath)
 
 args.savepath = savepath
@@ -219,6 +217,8 @@ args.savepath = savepath
 obs_dim = dataset.obs_dim
 # act_dim = 0
 
+print(args)
+
 #### model
 # model = MixerUnet(
 #     dim = 32,
@@ -226,15 +226,6 @@ obs_dim = dataset.obs_dim
 #     dim_mults = (1, 2, 4, 8),
 #     channels = 2,
 #     out_dim = 1,
-# ).cuda()
-
-# model = MixerUnetNew(
-#     H,
-#     obs_dim * 2,
-#     0,
-#     dim = 32,
-#     dim_mults = (1, 2, 4, 8),
-# #     out_dim = 1,
 # ).cuda()
 
 model = TemporalUnet(
@@ -258,7 +249,7 @@ diffusion = GaussianDiffusion(
 # reward_model, *_ = utils.load_model(reward_path, reward_epoch)
 # value_model, *_ = utils.load_model(value_path, value_epoch)
 # value_guide = guides.ValueGuide(reward_model, value_model, discount)
-env = StackEnv(conditional=False, save_render=args.save_render)
+env = PickandPutEnv(conditional=True, save_render=args.save_render)
 
 trainer = Trainer(
     diffusion,
@@ -274,8 +265,8 @@ trainer = Trainer(
 )
 
 
-print(f'Loading: {diffusion_epoch}')
-trainer.load(diffusion_epoch)
+print(f'Loading: {args.diffusion_epoch}')
+trainer.load(args.diffusion_epoch)
 render_kwargs = {
     'trackbodyid': 2,
     'distance': 10,
@@ -322,11 +313,32 @@ guide.load_state_dict(ckpt)
 # Yellow block 3
 #####################################################################
 
+if args.do_generate:
+    gen_dir = os.path.join(args.savepath, "gen_dataset")
+    args.gen_dir = gen_dir
+    if not osp.exists(gen_dir):
+        os.makedirs(gen_dir)
+
 rewards =  []
 
-for i in tqdm(range(int(args.eval_times))):
+max_rewards = 0.
+max_std = 0.
+max_id = 0
+
+for i in tqdm(range(args.eval_times)):
     reward = eval_episode(guide, env, dataset, idx=i, args=args)
-    # assert False
     rewards.append(reward)
-    print("rewards mean: ", np.mean(rewards))
+
+    mean_reward = np.mean(rewards)
+
+    print("rewards mean: ", mean_reward)
     print("rewards std: ", np.std(rewards) / len(rewards) ** 0.5)
+
+    if i > 90 and mean_reward >= max_rewards:
+        max_rewards = mean_reward
+        max_std = np.std(rewards) / len(rewards) ** 0.5
+        max_id = i + 1
+
+print("Max id:", max_id)
+print("Max rewards:", max_rewards)
+print("Corresponding std:", max_std)

@@ -9,11 +9,10 @@ import argparse
 # import gym
 # import d4rl
 
-from denoising_diffusion_pytorch.denoising_diffusion_pytorch import GaussianDiffusion
+from diffusion.denoising_diffusion_pytorch import GaussianDiffusion  # TODO
 from denoising_diffusion_pytorch import Trainer
 from denoising_diffusion_pytorch.datasets.tamp import KukaDataset
-from denoising_diffusion_pytorch.mixer_old import MixerUnet
-from denoising_diffusion_pytorch.mixer import MixerUnet as MixerUnetNew
+from denoising_diffusion_pytorch.mixer import MixerUnet
 from denoising_diffusion_pytorch.temporal_attention import TemporalUnet
 from denoising_diffusion_pytorch.utils.rendering import KukaRenderer
 import diffusion.utils as utils
@@ -45,6 +44,7 @@ def execute(samples, env, idx=0):
         action = np.concatenate([joint_pos, contact], dtype=np.float32)
 
         state, reward, done, _ = env.step(action)
+
         if env.save_render:
             im = env.render()
             ims.append(im)
@@ -78,17 +78,11 @@ def execute(samples, env, idx=0):
 
 def eval_episode(guide, env, dataset, idx=0, args=None):
     state = env.reset()
-    # states = [state]
-
-    # idxs = [(0, 3), (1, 0), (2, 1)]
-    # cond_idxs = [map_tuple[idx] for idx in idxs]
-    # stack_idxs = [idx[0] for idx in idxs]
-    # place_idxs = [idx[1] for idx in idxs]
 
     # samples_full_list = []
     obs_dim = dataset.obs_dim
 
-    samples = torch.Tensor(state)
+    samples = torch.Tensor(state[..., :-4])
     samples = (samples - dataset.mins) / (dataset.maxs - dataset.mins + 1e-8)
     samples = samples[None, None, None].cuda()
     samples = (samples - 0.5) * 2
@@ -100,11 +94,23 @@ def eval_episode(guide, env, dataset, idx=0, args=None):
     rewards = 0
     frames = []
 
+    counter = 0
+    map_tuple = {}
+    for i in range(4):
+        for j in range(4):
+            if i == j:
+                continue
+
+            map_tuple[(i, j)] = counter
+            counter = counter + 1
+
     total_samples = []
 
     for i in range(3):
-        # samples = samples_orig = trainer.ema_model.guided_conditional_sample(model, 1, conditions, cond_idxs[i], stack_idxs[i], place_idxs[i])
-        samples = samples_orig = trainer.ema_model.conditional_sample(1, conditions)
+        stack = env.goal[env.progress+1]
+        place = env.goal[env.progress]
+        cond_idx = map_tuple[(stack, place)]
+        samples = samples_orig = trainer.ema_model.guided_conditional_sample(guide, 1, conditions, cond_idx, stack, place)
 
         samples = torch.clamp(samples, -1, 1)
         samples_unscale = (samples + 1) * 0.5
@@ -117,12 +123,9 @@ def eval_episode(guide, env, dataset, idx=0, args=None):
 
         total_samples.extend(samples_list)
 
-        # samples_full_list.extend(samples_list)
-
         samples = (samples - dataset.mins) / (dataset.maxs - dataset.mins + 1e-8)
         samples = torch.Tensor(samples[None, None, None]).to(samples_orig.device)
         samples = (samples - 0.5) * 2
-
 
         conditions = [
                (0, obs_dim, samples),
@@ -135,27 +138,31 @@ def eval_episode(guide, env, dataset, idx=0, args=None):
         print("reward: %.4f   " % reward)
 
     if args is not None:
-        save_dir = os.path.join(args.savepath, "uncond_samples")
+        save_dir = os.path.join(args.savepath, "cond_samples")
     else:
-        save_dir = "uncond_samples"
+        save_dir = "cond_samples"
 
     if not osp.exists(save_dir):
         os.makedirs(save_dir)
 
     if env.save_render:
-        writer = get_writer(os.path.join(save_dir, "uncond_video_writer{}.mp4".format(idx)))
+        writer = get_writer(os.path.join(save_dir, "cond_video_writer{}.mp4".format(idx)))
         for frame in frames:
             writer.append_data(frame)
 
-    np.save(os.path.join(save_dir, "uncond_sample_{}.npy".format(idx)), np.array(total_samples))
+    np.save(os.path.join(save_dir, "cond_sample_{}.npy".format(idx)), np.array(total_samples))
 
     if args.do_generate:
         gen_dir = os.path.join(args.savepath, "gen_dataset")
         if not osp.exists(gen_dir):
             os.makedirs(gen_dir)
 
-        if rewards > 1.5:
-            np.save(os.path.join(gen_dir, "uncond_sample_{}.npy".format(idx)), np.array(total_samples))
+        if rewards > 0.5:
+            np.save(os.path.join(gen_dir, "cond_sample_{}.npy".format(idx)), np.array(total_samples))
+
+    # writer = get_writer("video_writer.mp4")
+    # for frame in frames:
+    #     writer.append_data(frame)
 
     return rewards
 
@@ -191,8 +198,9 @@ parser.add_argument('--suffix', default='0', type=str, help='save dir suffix')
 parser.add_argument('--env_name', default="multiple_cube_kuka_temporal_convnew_real2_128", type=str, help='env name')
 parser.add_argument('--data_path', default="kuka_dataset", type=str, help='dataset root path')
 
-parser.add_argument('--eval_times', default=100, type=str, help='evaluation times')
 parser.add_argument('--save_render', action='store_true', help='save render')
+parser.add_argument('--do_generate', action='store_true', help='do generate')
+parser.add_argument('--eval_times', default=100, type=str, help='evaluation times')
 parser.add_argument('--diffusion_epoch', default=650, type=int, help="diffusion epoch")
 
 args = parser.parse_args()
@@ -206,7 +214,6 @@ T = 1000
 dataset = KukaDataset(H, data_path=args.data_path)
 
 diffusion_path = f'logs/{env_name}/'
-diffusion_epoch = args.diffusion_epoch
 
 weighted = 5.0
 
@@ -219,6 +226,8 @@ args.savepath = savepath
 obs_dim = dataset.obs_dim
 # act_dim = 0
 
+print(args)
+
 #### model
 # model = MixerUnet(
 #     dim = 32,
@@ -226,15 +235,6 @@ obs_dim = dataset.obs_dim
 #     dim_mults = (1, 2, 4, 8),
 #     channels = 2,
 #     out_dim = 1,
-# ).cuda()
-
-# model = MixerUnetNew(
-#     H,
-#     obs_dim * 2,
-#     0,
-#     dim = 32,
-#     dim_mults = (1, 2, 4, 8),
-# #     out_dim = 1,
 # ).cuda()
 
 model = TemporalUnet(
@@ -258,7 +258,7 @@ diffusion = GaussianDiffusion(
 # reward_model, *_ = utils.load_model(reward_path, reward_epoch)
 # value_model, *_ = utils.load_model(value_path, value_epoch)
 # value_guide = guides.ValueGuide(reward_model, value_model, discount)
-env = StackEnv(conditional=False, save_render=args.save_render)
+env = StackEnv(conditional=True, save_render=args.save_render)
 
 trainer = Trainer(
     diffusion,
@@ -274,8 +274,8 @@ trainer = Trainer(
 )
 
 
-print(f'Loading: {diffusion_epoch}')
-trainer.load(diffusion_epoch)
+print(f'Loading: {args.diffusion_epoch}')
+trainer.load(args.diffusion_epoch)
 render_kwargs = {
     'trackbodyid': 2,
     'distance': 10,
@@ -309,6 +309,7 @@ ckpt = torch.load(guide_model_ckpt)
 
 guide.load_state_dict(ckpt)
 
+
 # samples_list = []
 # frames = []
 
@@ -326,7 +327,6 @@ rewards =  []
 
 for i in tqdm(range(int(args.eval_times))):
     reward = eval_episode(guide, env, dataset, idx=i, args=args)
-    # assert False
     rewards.append(reward)
     print("rewards mean: ", np.mean(rewards))
     print("rewards std: ", np.std(rewards) / len(rewards) ** 0.5)

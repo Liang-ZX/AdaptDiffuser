@@ -69,6 +69,8 @@ python scripts/conditional_kuka_planning_eval.py --env_name 'multiple_cube_kuka_
 # You can specify the directory name to save data with --suffix
 ```
 
+You can set a different dataset by specifying `--data_path`.
+
 ### Generate KUKA Pick and Place data
 ```shell
 python scripts/pick_kuka_planning_eval.py --env_name 'multiple_cube_kuka_temporal_convnew_real2_128' --diffusion_epoch 650 --save_render --do_generate --suffix ${SAVE_DIR_SUFFIX} --eval_times 1000
